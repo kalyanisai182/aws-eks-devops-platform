@@ -1,0 +1,10 @@
+# Helm values for kube-prometheus-stack (small footprint for a demo cluster)
+grafana:
+  adminPassword: "change-me"   # override with --set grafana.adminPassword=... in real use
+  service:
+    type: ClusterIP
+prometheus:
+  prometheusSpec:
+    retention: 3d
+    serviceMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false

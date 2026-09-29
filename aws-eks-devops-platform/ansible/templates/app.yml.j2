@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ app_name }}
+  namespace: {{ app_namespace }}
+  labels:
+    app: {{ app_name }}
+spec:
+  replicas: {{ app_replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: {{ app_name }}
+  template:
+    metadata:
+      labels:
+        app: {{ app_name }}
+    spec:
+{% if use_ecr %}
+      imagePullSecrets:
+        - name: ecr-pull
+{% endif %}
+      containers:
+        - name: app
+          image: {{ app_image }}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ app_name }}
+  namespace: {{ app_namespace }}
+  labels:
+    app: {{ app_name }}
+spec:
+  type: NodePort
+  selector:
+    app: {{ app_name }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: {{ app_nodeport }}

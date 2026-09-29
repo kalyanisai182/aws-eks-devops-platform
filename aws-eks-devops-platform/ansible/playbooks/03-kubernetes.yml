@@ -1,0 +1,138 @@
+---
+# Builds a kubeadm cluster: packages on every node, init on the control plane, join workers.
+
+- name: Install Kubernetes packages on all nodes
+  hosts: k8s
+  become: true
+  tasks:
+    - name: Download Kubernetes apt signing key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ kube_minor_version }}/deb/Release.key"
+        dest: /tmp/k8s-release.key
+        mode: "0644"
+
+    - name: Install Kubernetes apt signing key
+      ansible.builtin.command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ kube_minor_version }}/deb/ /"
+        filename: kubernetes
+        state: present
+
+    - name: Install kubelet, kubeadm and kubectl
+      ansible.builtin.apt:
+        name: [kubelet, kubeadm, kubectl]
+        state: present
+        update_cache: true
+
+    - name: Hold Kubernetes packages at the installed version
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+    - name: Enable kubelet
+      ansible.builtin.service:
+        name: kubelet
+        enabled: true
+
+- name: Initialise the control plane
+  hosts: control_plane
+  become: true
+  tasks:
+    - name: Run kubeadm init
+      ansible.builtin.command: >
+        kubeadm init
+        --pod-network-cidr={{ pod_network_cidr }}
+        --apiserver-advertise-address={{ private_ip }}
+        --apiserver-cert-extra-sans={{ ansible_host }}
+        --node-name={{ inventory_hostname }}
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Create kubeconfig directory for the SSH user
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    - name: Copy admin kubeconfig for the SSH user
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+
+    - name: Check whether the Flannel CNI is installed
+      ansible.builtin.command: kubectl get daemonset kube-flannel-ds -n kube-flannel
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: flannel_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install Flannel CNI
+      ansible.builtin.command: "kubectl apply -f {{ flannel_manifest_url }}"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: flannel_check.rc != 0
+
+    - name: Create a worker join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+    - name: Share the join command with the other plays
+      ansible.builtin.set_fact:
+        join_command: "{{ join_cmd.stdout }}"
+
+    - name: Fetch kubeconfig to this machine
+      ansible.builtin.fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ playbook_dir }}/../kubeconfig/admin.conf"
+        flat: true
+
+    - name: Point the local kubeconfig at the public IP
+      ansible.builtin.replace:
+        path: "{{ playbook_dir }}/../kubeconfig/admin.conf"
+        regexp: 'server: https://.*:6443'
+        replace: "server: https://{{ ansible_host }}:6443"
+      delegate_to: localhost
+      become: false
+
+- name: Join worker nodes
+  hosts: workers
+  become: true
+  tasks:
+    - name: Join the cluster
+      ansible.builtin.command: "{{ hostvars[groups['control_plane'][0]]['join_command'] }} --node-name={{ inventory_hostname }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+- name: Verify the cluster
+  hosts: control_plane
+  tasks:
+    - name: Wait until all nodes are Ready
+      ansible.builtin.shell: |
+        kubectl get nodes --no-headers | awk '{print $2}' | grep -vc '^Ready$' || true
+      register: not_ready
+      until: not_ready.stdout | trim == "0"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Show nodes
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: nodes
+      changed_when: false
+
+    - name: Print nodes
+      ansible.builtin.debug:
+        var: nodes.stdout_lines

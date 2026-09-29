@@ -1,0 +1,205 @@
+name: Infrastructure (Terraform + Ansible)
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "ansible/**"
+      - ".github/workflows/infra.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do with the Kubernetes-on-EC2 environment"
+        type: choice
+        options: [apply, destroy]
+        default: apply
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_DIR: terraform/ec2-k8s
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1) Static checks - no AWS credentials needed
+  # ------------------------------------------------------------------
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform fmt (advisory)
+        run: terraform fmt -check -recursive -diff terraform
+        continue-on-error: true
+
+      - name: Terraform validate (each stack)
+        run: |
+          for d in terraform/bootstrap terraform/eks terraform/ec2-k8s; do
+            echo "::group::$d"
+            terraform -chdir="$d" init -backend=false -input=false
+            terraform -chdir="$d" validate
+            echo "::endgroup::"
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible tooling
+        run: pip install ansible-core ansible-lint
+
+      - name: Ansible syntax check
+        working-directory: ansible
+        run: |
+          for p in playbooks/site.yml playbooks/04-deploy-app.yml playbooks/05-jenkins-server.yml; do
+            ansible-playbook -i inventory/hosts.ini.example "$p" --syntax-check
+          done
+
+      - name: Ansible lint
+        working-directory: ansible
+        run: ansible-lint playbooks/
+
+  # ------------------------------------------------------------------
+  # 2) Terraform plan on pull requests (needs the bootstrap stack + repo variables)
+  # ------------------------------------------------------------------
+  plan:
+    if: github.event_name == 'pull_request' && vars.TF_ROLE_ARN != ''
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TF_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare SSH keys
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_PUBLIC_KEY" > ~/.ssh/id_rsa.pub
+
+      - name: Terraform init (S3 backend + DynamoDB lock)
+        run: |
+          terraform -chdir="$TF_DIR" init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=ec2-k8s/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform plan
+        id: plan
+        env:
+          TF_VAR_admin_cidr: ${{ vars.ADMIN_CIDR }}
+        run: |
+          terraform -chdir="$TF_DIR" plan -input=false -no-color -lock=false | tee plan.txt
+
+      - name: Comment plan on the pull request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8');
+            const body = "### Terraform plan (ec2-k8s)\n<details><summary>Show plan</summary>\n\n```\n" +
+              plan.slice(-60000) + "\n```\n</details>";
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: context.issue.number, body
+            });
+
+  # ------------------------------------------------------------------
+  # 3) Apply / destroy on demand, behind the protected "production" environment
+  #    (configure required reviewers under Settings -> Environments)
+  # ------------------------------------------------------------------
+  apply:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: ec2-k8s-infra
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TF_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare SSH keys
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_PUBLIC_KEY" > ~/.ssh/id_rsa.pub
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Detect runner public IP
+        id: ip
+        run: echo "cidr=$(curl -s https://checkip.amazonaws.com | tr -d '\n')/32" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform init (S3 backend + DynamoDB lock)
+        run: |
+          terraform -chdir="$TF_DIR" init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=ec2-k8s/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform destroy
+        if: inputs.action == 'destroy'
+        env:
+          TF_VAR_admin_cidr: ${{ vars.ADMIN_CIDR }}
+        run: terraform -chdir="$TF_DIR" destroy -input=false -auto-approve
+
+      - name: Terraform apply
+        if: inputs.action == 'apply'
+        env:
+          TF_VAR_admin_cidr: ${{ vars.ADMIN_CIDR }}
+          TF_VAR_extra_admin_cidrs: '["${{ steps.ip.outputs.cidr }}"]'
+        run: terraform -chdir="$TF_DIR" apply -input=false -auto-approve
+
+      # Terraform has just written ansible/inventory/hosts.ini - configure the servers with it.
+      - uses: actions/setup-python@v5
+        if: inputs.action == 'apply'
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible
+        if: inputs.action == 'apply'
+        run: pip install ansible
+
+      - name: Wait for SSH on all nodes
+        if: inputs.action == 'apply'
+        working-directory: ansible
+        run: ansible all -m ansible.builtin.wait_for_connection -a "timeout=300"
+
+      - name: Configure nodes (OS -> Docker -> Kubernetes)
+        if: inputs.action == 'apply'
+        working-directory: ansible
+        run: ansible-playbook playbooks/site.yml
+
+      # Close the temporary SSH opening for this runner
+      - name: Revoke runner SSH access
+        if: always() && inputs.action == 'apply'
+        continue-on-error: true
+        env:
+          TF_VAR_admin_cidr: ${{ vars.ADMIN_CIDR }}
+          TF_VAR_extra_admin_cidrs: "[]"
+        run: terraform -chdir="$TF_DIR" apply -input=false -auto-approve

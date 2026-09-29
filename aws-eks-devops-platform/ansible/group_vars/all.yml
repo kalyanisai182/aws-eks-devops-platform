@@ -1,0 +1,16 @@
+---
+# Kubernetes
+kube_minor_version: "v1.30"          # apt repo channel (pkgs.k8s.io)
+pod_network_cidr: "10.244.0.0/16"    # matches Flannel's default
+flannel_manifest_url: "https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+
+# Application (playbook 04)
+app_namespace: devops-app
+app_name: devops-app
+app_replicas: 2
+app_nodeport: 30080
+# Full image reference to deploy, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/eks-devops-app:abc1234
+# Pass at run time:  -e app_image=<image>
+app_image: "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/eks-devops-app:latest"
+use_ecr: true                        # create an ECR pull secret on the cluster
+aws_region: us-east-1

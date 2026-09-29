@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: devops-app
+  namespace: devops-app
+  labels:
+    release: kube-prometheus-stack   # must match the Helm release name
+spec:
+  selector:
+    matchLabels:
+      app: devops-app
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

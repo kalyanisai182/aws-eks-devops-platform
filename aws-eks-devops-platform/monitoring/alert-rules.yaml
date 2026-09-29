@@ -1,0 +1,35 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: devops-app-alerts
+  namespace: devops-app
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: devops-app
+      rules:
+        - alert: HighErrorRate
+          expr: |
+            sum(rate(app_requests_total{status=~"5.."}[5m]))
+              / sum(rate(app_requests_total[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "More than 5% of requests are failing"
+        - alert: HighLatencyP95
+          expr: |
+            histogram_quantile(0.95, sum(rate(app_request_latency_seconds_bucket[5m])) by (le)) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "p95 latency above 500ms"
+        - alert: AppPodsNotReady
+          expr: kube_deployment_status_replicas_available{namespace="devops-app",deployment="devops-app"} < 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No available replicas for devops-app"

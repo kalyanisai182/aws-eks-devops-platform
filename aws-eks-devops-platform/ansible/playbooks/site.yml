@@ -1,0 +1,12 @@
+---
+# Full run: base OS -> Docker/containerd -> Kubernetes cluster.
+# The app (04) is deployed separately because it needs an image reference:
+#   ansible-playbook playbooks/04-deploy-app.yml -e app_image=<image>
+- name: Step 1 - base OS preparation
+  ansible.builtin.import_playbook: 01-common.yml
+
+- name: Step 2 - Docker and containerd
+  ansible.builtin.import_playbook: 02-docker.yml
+
+- name: Step 3 - Kubernetes cluster
+  ansible.builtin.import_playbook: 03-kubernetes.yml

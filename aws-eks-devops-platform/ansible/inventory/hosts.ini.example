@@ -1,0 +1,20 @@
+# Terraform (terraform/ec2-k8s) generates inventory/hosts.ini automatically.
+# This example shows the expected shape if you want to use your own servers.
+[control_plane]
+control-plane ansible_host=203.0.113.10 private_ip=10.20.1.10
+
+[workers]
+worker-1 ansible_host=203.0.113.11 private_ip=10.20.1.11
+worker-2 ansible_host=203.0.113.12 private_ip=10.20.1.12
+
+[k8s:children]
+control_plane
+workers
+
+[jenkins]
+# jenkins-server ansible_host=203.0.113.20
+
+[all:vars]
+ansible_user=ubuntu
+ansible_ssh_private_key_file=~/.ssh/id_rsa
+ansible_python_interpreter=/usr/bin/python3

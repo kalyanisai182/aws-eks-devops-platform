@@ -1,0 +1,6 @@
+# Copy to terraform/backend.hcl (git-ignored) and fill in from `terraform output` in terraform/bootstrap.
+bucket         = "devops-bootstrap-tfstate-123456789012"
+region         = "us-east-1"
+dynamodb_table = "devops-bootstrap-tf-lock"
+encrypt        = true
+# "key" differs per stack and is passed on the command line (see Makefile / README).

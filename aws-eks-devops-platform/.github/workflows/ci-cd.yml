@@ -1,0 +1,162 @@
+name: CI-CD (app)
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["app/**", "k8s/**", "ansible/templates/**", "ansible/playbooks/04-deploy-app.yml", ".github/workflows/ci-cd.yml"]
+  push:
+    branches: [main]
+    paths: ["app/**", "k8s/**", "ansible/templates/**", "ansible/playbooks/04-deploy-app.yml", ".github/workflows/ci-cd.yml"]
+
+permissions:
+  id-token: write   # OIDC -> AWS, no stored access keys
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}   # Path A: eks-devops-app | Path B: k8s-ansible-app
+
+# Repository variable DEPLOY_TARGET selects where the image is deployed:
+#   eks       -> Path A (kubectl apply to EKS)
+#   ec2-k8s   -> Path B (Ansible playbook 04 on the Terraform-built cluster)
+#   (unset)   -> build, scan and push only
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+      - name: Install deps
+        run: pip install -r app/requirements-dev.txt
+      - name: Unit tests
+        working-directory: app
+        run: pytest --cov=app --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: app/coverage.xml
+
+  build-push:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image reference
+        id: meta
+        run: echo "image=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: docker build -t "${{ steps.meta.outputs.image }}" app/
+
+      - name: Scan image with Trivy (fail on fixable CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Push image
+        run: docker push "${{ steps.meta.outputs.image }}"
+
+  # ---------------- Path A: EKS ----------------
+  deploy-eks:
+    needs: build-push
+    if: vars.DEPLOY_TARGET == 'eks'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "${{ vars.EKS_CLUSTER }}"
+
+      - name: Deploy to EKS
+        env:
+          IMAGE: ${{ needs.build-push.outputs.image }}
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|; s|VERSION_PLACEHOLDER|${GITHUB_SHA::7}|" k8s/deployment.yaml
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/
+          kubectl -n devops-app rollout status deployment/devops-app --timeout=180s
+
+  # ---------------- Path B: Terraform-built cluster, deployed with Ansible ----------------
+  deploy-ec2-k8s:
+    needs: build-push
+    if: vars.DEPLOY_TARGET == 'ec2-k8s'
+    runs-on: ubuntu-latest
+    env:
+      K8S_PROJECT: ${{ vars.K8S_PROJECT || 'k8s-ansible' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Write SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Build Ansible inventory from running EC2 instances
+        run: scripts/gen-inventory.sh "$K8S_PROJECT" "$HOME/.ssh/id_rsa"
+
+      - name: Temporarily allow SSH from this runner
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${K8S_PROJECT}-sg" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          RUNNER_CIDR="$(curl -s https://checkip.amazonaws.com | tr -d '\n')/32"
+          aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
+            --protocol tcp --port 22 --cidr "$RUNNER_CIDR"
+          echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
+          echo "cidr=$RUNNER_CIDR" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Deploy with Ansible
+        working-directory: ansible
+        run: |
+          ansible all -m ansible.builtin.wait_for_connection -a "timeout=120"
+          ansible-playbook playbooks/04-deploy-app.yml \
+            -e app_image="${{ needs.build-push.outputs.image }}" \
+            -e aws_region="$AWS_REGION"
+
+      - name: Revoke runner SSH access
+        if: always() && steps.sg.outputs.sg_id != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "${{ steps.sg.outputs.sg_id }}" \
+            --protocol tcp --port 22 --cidr "${{ steps.sg.outputs.cidr }}"

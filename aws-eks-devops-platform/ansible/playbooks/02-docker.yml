@@ -1,0 +1,66 @@
+---
+# Installs Docker Engine + containerd and configures containerd for Kubernetes (systemd cgroups).
+- name: Install and configure Docker / containerd
+  hosts: k8s
+  become: true
+
+  tasks:
+    - name: Create apt keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        filename: docker
+        state: present
+
+    - name: Install Docker Engine and containerd
+      ansible.builtin.apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin]
+        state: present
+        update_cache: true
+
+    - name: Check whether containerd already uses the systemd cgroup driver
+      ansible.builtin.command: grep -q "SystemdCgroup = true" /etc/containerd/config.toml
+      register: containerd_cgroup
+      failed_when: false
+      changed_when: false
+
+    - name: Generate containerd config with SystemdCgroup enabled
+      ansible.builtin.shell: |
+        containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/' > /etc/containerd/config.toml
+      when: containerd_cgroup.rc != 0
+      notify: Restart containerd
+
+    - name: Ensure docker and containerd are running
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: [containerd, docker]
+
+    - name: Allow the SSH user to run docker without sudo
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+
+    - name: Smoke test Docker
+      ansible.builtin.command: docker run --rm hello-world
+      run_once: true
+      changed_when: false
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.service:
+        name: containerd
+        state: restarted

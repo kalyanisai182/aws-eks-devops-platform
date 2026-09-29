@@ -1,0 +1,60 @@
+---
+# Deploys the application to the kubeadm cluster (NodePort service; no cloud load balancer here).
+# Usage: ansible-playbook playbooks/04-deploy-app.yml -e app_image=<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>
+- name: Deploy application to Kubernetes
+  hosts: control_plane
+  become: false
+  environment:
+    KUBECONFIG: "/home/{{ ansible_user }}/.kube/config"
+
+  tasks:
+    - name: Refuse to deploy the placeholder image
+      ansible.builtin.assert:
+        that: "'ACCOUNT_ID' not in app_image"
+        fail_msg: "Set a real image: -e app_image=<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>"
+
+    - name: Create namespace
+      ansible.builtin.shell: kubectl create namespace {{ app_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      register: ns
+      changed_when: "'created' in ns.stdout"
+
+    - name: Install AWS CLI (for ECR authentication)
+      ansible.builtin.apt:
+        name: awscli
+        state: present
+        update_cache: true
+      become: true
+      when: use_ecr
+
+    - name: Create or refresh the ECR pull secret (token is valid for 12h)
+      ansible.builtin.shell: |
+        set -o pipefail
+        REGISTRY="{{ app_image.split('/')[0] }}"
+        TOKEN=$(aws ecr get-login-password --region {{ aws_region }})
+        kubectl -n {{ app_namespace }} create secret docker-registry ecr-pull \
+          --docker-server="$REGISTRY" --docker-username=AWS --docker-password="$TOKEN" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+      no_log: true
+      changed_when: true
+      when: use_ecr
+
+    - name: Render application manifest
+      ansible.builtin.template:
+        src: ../templates/app.yml.j2
+        dest: /tmp/app.yml
+        mode: "0644"
+
+    - name: Apply application manifest
+      ansible.builtin.command: kubectl apply -f /tmp/app.yml
+      register: apply
+      changed_when: "'configured' in apply.stdout or 'created' in apply.stdout"
+
+    - name: Wait for the rollout
+      ansible.builtin.command: kubectl -n {{ app_namespace }} rollout status deployment/{{ app_name }} --timeout=180s
+      changed_when: false
+
+    - name: Show where the app is reachable
+      ansible.builtin.debug:
+        msg: "App is available at http://{{ hostvars[groups['workers'][0]]['ansible_host'] }}:{{ app_nodeport }}/health"

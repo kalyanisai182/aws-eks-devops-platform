@@ -1,0 +1,94 @@
+// Alternative to GitHub Actions: the same flow on a Jenkins agent that has
+// docker, aws-cli, kubectl, python3 and (optionally) the SonarQube scanner installed.
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        ECR_REPOSITORY = 'eks-devops-app'
+        EKS_CLUSTER    = 'eks-devops-cluster'
+        IMAGE_TAG      = "${env.GIT_COMMIT.take(7)}"
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Unit tests') {
+            steps {
+                sh '''
+                python3 -m venv .venv
+                . .venv/bin/activate
+                pip install -r app/requirements-dev.txt
+                cd app && pytest --cov=app --cov-report=xml
+                '''
+            }
+        }
+
+        stage('SonarQube analysis') {
+            steps {
+                withSonarQubeEnv('sonarqube') {   // server name configured in Jenkins
+                    sh 'sonar-scanner'
+                }
+            }
+        }
+
+        stage('Quality gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build & scan image') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                    sh '''
+                    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                    REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                    docker build -t "${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" app/
+                    trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed "${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+                    '''
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                    sh '''
+                    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                    REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                    aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+                    docker push "${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to EKS') {
+            when { branch 'main' }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                    sh '''
+                    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                    IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
+                    aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER"
+                    sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|; s|VERSION_PLACEHOLDER|${IMAGE_TAG}|" k8s/deployment.yaml
+                    kubectl apply -f k8s/namespace.yaml
+                    kubectl apply -f k8s/
+                    kubectl -n devops-app rollout status deployment/devops-app --timeout=180s
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        failure { echo 'Pipeline failed - check the stage logs above.' }
+        always  { cleanWs() }
+    }
+}

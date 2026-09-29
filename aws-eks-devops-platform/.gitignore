@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.coverage
+coverage.xml
+.terraform/
+*.tfstate*
+*.tfvars
+backend.hcl
+ansible/inventory/hosts.ini
+ansible/kubeconfig/admin.conf
